@@ -1109,10 +1109,6 @@ impl CabrilloLog {
 	}
 }
 
-/* TODO
-pub struct LogReader;
-pub struct LogWriter;*/
-
 #[cfg(test)]
 mod tests {
 	use std::fs::{self, File};
