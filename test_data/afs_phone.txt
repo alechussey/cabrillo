@@ -1,0 +1,20 @@
+START-OF-LOG: 2.0
+CONTEST: RSGB-AFS-SSB
+CALLSIGN: G9HOG
+CLAIMED-SCORE: 70
+OPERATORS: M6WIZ
+CLUB: Hogwarts Radio Club 
+NAME: H. Potter
+ADDRESS: Owl Lane
+ADDRESS: Upnorth
+ADDRESS: MA6 1CK
+SOAPBOX: Only a brief spell of operating
+QSO:  3612 PH 2016-01-16 1721 G9HOG         59  001    G3SQX         59  203    
+QSO:  3614 PH 2016-01-16 1723 G9HOG         59  002    G4TSH/P       59  210    
+QSO:  3625 PH 2016-01-16 1724 G9HOG         59  003    G0MTN         59  182    
+QSO:  3609 PH 2016-01-16 1726 G9HOG         59  004    G3UFY         59  205    
+QSO:  7141 PH 2016-01-16 1727 G9HOG         59  005    G3XSV         59  215    
+QSO:  7148 PH 2016-01-16 1728 G9HOG         59  006    G3SQX         59  207    
+QSO:  7068 PH 2016-01-16 1729 G9HOG         59  007    G4VXE         59  021    
+END-OF-LOG:
+

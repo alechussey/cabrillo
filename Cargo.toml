@@ -1,0 +1,18 @@
+[package]
+name = "cabrillo"
+version = "0.1.0"
+authors = ["Alec Hussey <alec.hussey@madsoft.org>"]
+license = "BSD-2-Clause"
+description = "A nom parser for the Cabrillo file format used for submitting contest logs in amateur radio."
+keywords = ["cabrillo", "parser"]
+categories = ["parser-implementations"]
+homepage = ""
+documentation = ""
+repository = ""
+readme = ""
+edition = "2018"
+
+[dependencies]
+lazy_static = "1.4"
+nom = { version = "5.1", features = ["regexp_macros"] }
+chrono = "0.4"
