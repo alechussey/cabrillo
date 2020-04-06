@@ -6,9 +6,9 @@ license = "MIT"
 description = "A nom parser for the Cabrillo file format used for submitting contest logs in amateur radio."
 keywords = ["cabrillo", "parser"]
 categories = ["parser-implementations"]
-homepage = ""
-documentation = ""
-repository = ""
+homepage = "https://github.com/alechussey/cabrillo"
+documentation = "https://docs.rs/crate/cabrillo"
+repository = "https://github.com/alechussey/cabrillo.git"
 readme = "README.md"
 edition = "2018"
 

@@ -4,7 +4,7 @@ A Rust / nom parser for the Cabrillo file format used for submitting contest log
 
 ## Example
 
-```
+```rust
 use std::fs;
 use cabrillo::CabrilloLog;
 
