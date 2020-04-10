@@ -576,7 +576,7 @@ impl Qso {
 	}
 
 	/// Signal report received from other station.
-	pub fn rst_recvd(&self) -> &SignalReport {
+	pub fn rst_received(&self) -> &SignalReport {
 		&self.rst_recvd
 	}
 
