@@ -11,11 +11,11 @@ use std::error::Error;
 use std::convert::TryFrom;
 use std::collections::HashMap;
 use chrono::NaiveDateTime;
-use nom::character::{is_space, is_digit};
+use nom::character::is_digit;
 use nom::character::complete::{
 	digit1,
 	multispace0,
-	alphanumeric0,
+	alphanumeric1,
 	not_line_ending
 };
 
@@ -73,20 +73,40 @@ named!(
 	)
 );
 
+// The only nice way to deal with minor differences in the QSO format is to have
+// separate parsers. If you don't do this then you inevitably end up down a rabbit
+// hole full of regressions and undefined behavior.
+
 named!(
-	cabrillo_qso<&str, (&str, &str, &str, &str, &str, &str, &str, &str, &str)>,
+	cabrillo_qso_format1<&str, (&str, &str, &str, &str, &str, &str, &str, &str, &str)>,
 	sep!(
 		multispace0,
 		tuple!(
-			digit1,                                              // Frequency
-			cabrillo_mode,                                       // Mode
-			cabrillo_datetime,                                   // QSO timestamp
-			cabrillo_callsign,                                   // Sent call
-			take_while_m_n!(2, 3, |c: char| is_digit(c as u8)),  // Sent RST
-			take_till1!(|c: char| is_space(c as u8)),            // Sent exch
-			cabrillo_callsign,                                   // Rcvd call
-			take_while_m_n!(2, 3, |c: char| is_digit(c as u8)),  // Rcvd RST
-			alphanumeric0                                        // Rcvd exch
+			digit1,             // Frequency
+			cabrillo_mode,      // Mode
+			cabrillo_datetime,  // QSO timestamp
+			cabrillo_callsign,  // Sent call
+			alphanumeric1,      // Sent RST or exchange
+			alphanumeric1,      // Sent exchange
+			cabrillo_callsign,  // Rcvd call
+			alphanumeric1,      // Rcvd RST or exchange
+			alphanumeric1       // Rcvd exchange
+		)
+	)
+);
+
+named!(
+	cabrillo_qso_format2<&str, (&str, &str, &str, &str, &str, &str, &str)>,
+	sep!(
+		multispace0,
+		tuple!(
+			digit1,             // Frequency
+			cabrillo_mode,      // Mode
+			cabrillo_datetime,  // QSO timestamp
+			cabrillo_callsign,  // Sent call
+			alphanumeric1,      // Sent exchange
+			cabrillo_callsign,  // Rcvd call
+			alphanumeric1       // Rcvd exchange
 		)
 	)
 );
@@ -538,10 +558,10 @@ pub struct Qso {
 	mode: Mode,
 	datetime: NaiveDateTime,
 	call_sent: String,
-	rst_sent: SignalReport,
+	rst_sent: Option<SignalReport>,
 	exch_sent: String,
 	call_recvd: String,
-	rst_recvd: SignalReport,
+	rst_recvd: Option<SignalReport>,
 	exch_recvd: String,
 	transmitter_id: bool
 }
@@ -561,7 +581,7 @@ impl Qso {
 	}
 
 	/// Signal report sent during QSO.
-	pub fn rst_sent(&self) -> &SignalReport {
+	pub fn rst_sent(&self) -> &Option<SignalReport> {
 		&self.rst_sent
 	}
 
@@ -576,7 +596,7 @@ impl Qso {
 	}
 
 	/// Signal report received from other station.
-	pub fn rst_received(&self) -> &SignalReport {
+	pub fn rst_received(&self) -> &Option<SignalReport> {
 		&self.rst_recvd
 	}
 
@@ -736,12 +756,110 @@ impl CabrilloLog {
 		Ok(())
 	}
 
+	fn parse_qso_format1(&self, line_no: usize, tag: &str, value: &str) -> CabrilloResult<Qso> {
+		let qso_data = cabrillo_qso_format1(value)
+			.map_err(|_| {
+				CabrilloError::new(tag, line_no, 
+					CabrilloErrorKind::ParseError(
+						format!("Invalid value '{}' (not valid QSO format)", value)))
+			})?;
+		let qso_data = qso_data.1;
+
+		// FIXME: impl FromStr for Frequency
+		// FIXME: this does not validate the data and the provided frequency may not be in KHz
+		let frequency: Frequency = qso_data.0.parse::<u32>()
+			.map(|freq| Frequency::Khz(freq))
+			.map_err(|_| {
+				CabrilloError::new(tag, line_no, 
+					CabrilloErrorKind::ParseError(
+						format!("Invalid value '{}' (invalid frequency)", value)))
+			})?;
+
+		let mode: Mode = qso_data.1.parse()
+			.map_err(|err_kind| CabrilloError::new(tag, line_no, err_kind))?;
+
+		let timestamp: NaiveDateTime = NaiveDateTime::parse_from_str(qso_data.2, "%Y-%m-%d %H%M")
+			.map_err(|_| {
+				CabrilloError::new(tag, line_no, 
+					CabrilloErrorKind::ParseError(
+						format!("Invalid value '{}' (invalid timestamp)", value)))
+			})?;
+
+		let sent_call: String = qso_data.3.to_string();
+		// attempt to extract signal report from exchange info
+		let sent_rst: Option<SignalReport> = qso_data.4.parse::<SignalReport>().ok();
+		let sent_exch: String = format!("{} {}", qso_data.4, qso_data.5);
+
+		let recvd_call: String = qso_data.6.to_string();
+		// attempt to extract signal report from exchange info
+		let recvd_rst: Option<SignalReport> = qso_data.7.parse::<SignalReport>().ok();
+		let recvd_exch = format!("{} {}", qso_data.7, qso_data.8);
+
+		Ok(Qso {
+			frequency: frequency,
+			mode: mode,
+			datetime: timestamp,
+			call_sent: sent_call,
+			rst_sent: sent_rst,
+			exch_sent: sent_exch,
+			call_recvd: recvd_call,
+			rst_recvd: recvd_rst,
+			exch_recvd: recvd_exch,
+			transmitter_id: false
+		})
+	}
+
+	fn parse_qso_format2(&self, line_no: usize, tag: &str, value: &str) -> CabrilloResult<Qso> {
+		let qso_data = cabrillo_qso_format2(value)
+			.map_err(|_| {
+				CabrilloError::new(tag, line_no, 
+					CabrilloErrorKind::ParseError(
+						format!("Invalid value '{}' (not valid QSO format)", value)))
+			})?;
+		let qso_data = qso_data.1;
+
+		let frequency: Frequency = qso_data.0.parse::<u32>()
+			.map(|freq| Frequency::Khz(freq))
+			.map_err(|_| {
+				CabrilloError::new(tag, line_no, 
+					CabrilloErrorKind::ParseError(
+						format!("Invalid value '{}' (invalid frequency)", value)))
+			})?;
+
+		let mode: Mode = qso_data.1.parse()
+			.map_err(|err_kind| CabrilloError::new(tag, line_no, err_kind))?;
+
+		let timestamp: NaiveDateTime = NaiveDateTime::parse_from_str(qso_data.2, "%Y-%m-%d %H%M")
+			.map_err(|_| {
+				CabrilloError::new(tag, line_no, 
+					CabrilloErrorKind::ParseError(
+						format!("Invalid value '{}' (invalid timestamp)", value)))
+			})?;
+
+		let sent_call: String = qso_data.3.to_string();
+		let sent_exch: String = qso_data.4.to_string();
+		let recvd_call: String = qso_data.5.to_string();
+		let recvd_exch = qso_data.6.to_string();
+
+		Ok(Qso {
+			frequency: frequency,
+			mode: mode,
+			datetime: timestamp,
+			call_sent: sent_call,
+			rst_sent: None,
+			exch_sent: sent_exch,
+			call_recvd: recvd_call,
+			rst_recvd: None,
+			exch_recvd: recvd_exch,
+			transmitter_id: false
+		})
+	}
+
 	fn parse_tag(&mut self, line_no: usize, tag: &str, value: &str) -> CabrilloResult<()> {
 		let value = value.trim();
 		let parse_error = CabrilloError::new(tag, line_no, 
 			CabrilloErrorKind::ParseError(format!("Invalid value '{}'", value)));
  
-		// FIXME: it might be better to map all of these tags to parse functions with a HashMap or something
 		match tag {
 			"START-OF-LOG" => {
 				self.version = value.parse()
@@ -762,6 +880,12 @@ impl CabrilloLog {
 					"NON-ASSISTED" => Some(false),
 					_ => return Err(parse_error.clone())
 				};
+			},
+			"CATEGORY-BAND" => {
+				let band: Band = value
+					.parse()
+					.map_err(|err_kind| CabrilloError::new(tag, line_no, err_kind))?;
+				self.category_band = Some(band);
 			},
 			"CATEGORY-MODE" => {
 				let mode: Mode = value
@@ -861,7 +985,8 @@ impl CabrilloLog {
 				// the nuances surrounding separated_nonempty_list and complete/streaming
 				// FIXME: validate callsigns
 				value
-					.split(|c| c == ',')
+					.split(|c| c == ',' || c == ' ')
+					.filter(|call| call.len() > 0)
 					.for_each(|call| {
 						self.operators.push(call.trim().to_string())
 					});
@@ -902,59 +1027,11 @@ impl CabrilloLog {
 				}
 			},
 			"QSO" | "X-QSO" => {
-				let qso_data = cabrillo_qso(value)
-					.map_err(|_| {
-						CabrilloError::new(tag, line_no, 
-							CabrilloErrorKind::ParseError(
-								format!("Invalid value '{}' (not valid QSO format)", value)))
-					})?;
-				let qso_data = qso_data.1;
-
-				// FIXME: impl FromStr for Frequency
-				let frequency: Frequency = qso_data.0.parse::<u32>()
-					.map(|freq| Frequency::Khz(freq))
-					.map_err(|_| {
-						CabrilloError::new(tag, line_no, 
-							CabrilloErrorKind::ParseError(
-								format!("Invalid value '{}' (invalid frequency)", value)))
-					})?;
-
-				let mode: Mode = qso_data.1.parse()
-					.map_err(|err_kind| CabrilloError::new(tag, line_no, err_kind))?;
-
-				let timestamp: NaiveDateTime = NaiveDateTime::parse_from_str(qso_data.2, "%Y-%m-%d %H%M")
-					.map_err(|_| {
-						CabrilloError::new(tag, line_no, 
-							CabrilloErrorKind::ParseError(
-								format!("Invalid value '{}' (invalid timestamp)", value)))
-					})?;
-
-				let sent_call: String = qso_data.3.to_string();
-
-				let sent_rst: SignalReport = qso_data.4.parse()
-					.map_err(|err_kind| CabrilloError::new(tag, line_no, err_kind))?;
-
-				let sent_exch: String = qso_data.5.to_string();
-
-				let recvd_call: String = qso_data.6.to_string();
-
-				let recvd_rst: SignalReport = qso_data.7.parse()
-					.map_err(|err_kind| CabrilloError::new(tag, line_no, err_kind))?;
-
-				let recvd_exch: String = qso_data.8.to_string();
-
-				let qso = Qso {
-					frequency: frequency,
-					mode: mode,
-					datetime: timestamp,
-					call_sent: sent_call,
-					rst_sent: sent_rst,
-					exch_sent: sent_exch,
-					call_recvd: recvd_call,
-					rst_recvd: recvd_rst,
-					exch_recvd: recvd_exch,
-					transmitter_id: false
-				};
+				// first attempt to parse QSO in format1 then try format2 as a fallback
+				// if all else fails, convert the error type into CabrilloError and fail
+				// out of this function
+				let qso = self.parse_qso_format1(line_no, tag, value)
+					.or_else(|_| self.parse_qso_format2(line_no, tag, value))?;
 
 				if tag == "QSO" {
 					self.entries.push(qso);
@@ -1122,8 +1199,10 @@ mod tests {
 			"test_data/neqp.txt",
 			"test_data/rdxc.txt",
 			"test_data/cqww.txt",
+			"test_data/cqww_vhf.txt",
 			"test_data/cqwpx.txt",
-			"test_data/cqwpx_rtty.txt"
+			"test_data/cqwpx_rtty.txt",
+			"test_data/ncj_naqp.txt"
 		]
 			.iter()
 			.for_each(|path| {
