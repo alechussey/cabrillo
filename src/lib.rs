@@ -64,12 +64,10 @@ named!(
 
 named!(
 	cabrillo_offtime<&str, (&str, &str)>,
-	dbg!(
-		separated_pair!(
-			cabrillo_datetime,
-			char!(' '),
-			cabrillo_datetime
-		)
+	separated_pair!(
+		cabrillo_datetime,
+		char!(' '),
+		cabrillo_datetime
 	)
 );
 

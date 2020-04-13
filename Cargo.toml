@@ -1,6 +1,6 @@
 [package]
 name = "cabrillo"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["Alec Hussey <alec.hussey@madsoft.org>"]
 license = "MIT"
 description = "A nom parser for the Cabrillo file format used for submitting contest logs in amateur radio."
