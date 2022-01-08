@@ -1,113 +1,613 @@
 #[macro_use]
 extern crate lazy_static;
-#[macro_use]
 extern crate nom;
 extern crate chrono;
 
+use std::str;
 use std::io::BufRead;
-use std::str::{self, FromStr};
 use std::fmt::{self, Display};
 use std::error::Error;
 use std::convert::TryFrom;
 use std::collections::HashMap;
 use chrono::NaiveDateTime;
-use nom::character::is_digit;
-use nom::character::complete::{
-	digit1,
-	multispace0,
-	alphanumeric1,
-	not_line_ending
+use nom::{
+	IResult,
+	branch::alt,
+	multi::{
+		many1,
+		many_m_n,
+		fold_many1
+	},
+	combinator::{
+		eof,
+		not,
+		opt,
+		value,
+		recognize,
+		complete,
+		map,
+		map_res
+	},
+	sequence::{
+		tuple,
+		preceded,
+		terminated,
+		separated_pair
+	},
+	bytes::complete::{
+		tag,
+		take_while_m_n
+	},
+	character::complete::{
+		digit1,
+		space0,
+		space1,
+		alphanumeric1,
+		not_line_ending,
+		one_of,
+		char
+	}
 };
 
-fn is_cabrillo_tag(c: char) -> bool {
-	c.is_ascii_uppercase() || is_digit(c as u8) || c == '-' || c == '\'' || c == ' '
+macro_rules! parser_map {
+	(<$type: ty> $($key: expr => $value: expr),*) => {{
+		let mut map = HashMap::new();
+		$( map.insert($key, $value as $type); )*
+		map
+	}}
 }
 
-named!(
-	cabrillo_tag<&str, (&str, &str)>,
-	alt!(
-		complete!(
-			separated_pair!(
-				take_while1!(is_cabrillo_tag), 
-				tag!(": "), // the spec requires a space after the colon
+lazy_static! {
+	static ref TAGS: HashMap<&'static str, for<'a> fn(&'a str, &'a mut CabrilloLog) -> IResult<&'a str, ()>> = {
+		parser_map![
+			<for<'a> fn(&'a str, &'a mut CabrilloLog) -> IResult<&'a str, ()>> 
+			"START-OF-LOG"         => cabrillo_log_start,
+			"CALLSIGN"             => cabrillo_log_callsign,
+			"CONTEST"              => cabrillo_log_contest,
+			"CATEGORY-ASSISTED"    => cabrillo_log_category_assisted,
+			"CATEGORY-BAND"        => cabrillo_log_category_band,
+			"CATEGORY-MODE"        => cabrillo_log_category_mode,
+			"CATEGORY-OPERATOR"    => cabrillo_log_category_operator,
+			"CATEGORY-POWER"       => cabrillo_log_category_power,
+			"CATEGORY-STATION"     => cabrillo_log_category_station,
+			"CATEGORY-TIME"        => cabrillo_log_category_time,
+			"CATEGORY-TRANSMITTER" => cabrillo_log_category_xmitter,
+			"CATEGORY-OVERLAY"     => cabrillo_log_category_overlay,
+			"CERTIFICATE"          => cabrillo_log_certificate,
+			"CLAIMED-SCORE"        => cabrillo_log_claimed_score,
+			"CLUB"                 => cabrillo_log_club,
+			"CREATED-BY"           => cabrillo_log_created_by,
+			"EMAIL"                => cabrillo_log_email,
+			"GRID-LOCATOR"         => cabrillo_log_grid_locator,
+			"LOCATION"             => cabrillo_log_location,
+			"NAME"                 => cabrillo_log_name,
+			"ADDRESS"              => cabrillo_log_addr_fragment,
+			"ADDRESS-CITY"         => cabrillo_log_addr_fragment,
+			"ADDRESS-STATE-PROVINCE" => cabrillo_log_addr_fragment,
+			"ADDRESS-POSTALCODE"   => cabrillo_log_addr_fragment,
+			"ADDRESS-COUNTRY"      => cabrillo_log_addr_fragment,
+			"OPERATORS"            => cabrillo_log_operators,
+			"OFFTIME"              => cabrillo_log_offtime,
+			"SOAPBOX"              => cabrillo_log_soapbox,
+			"X-QSO"                => cabrillo_ignore_qso,
+			"QSO"                  => cabrillo_log_qso,
+			"DEBUG"                => cabrillo_log_debug,
+			"END-OF-LOG"           => cabrillo_log_end
+		]
+	};
+}
+
+fn cabrillo_tag(input: &str) -> IResult<&str, (&str, &str)> {
+	alt((
+		complete(
+			separated_pair(
+				recognize(many1(one_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-' "))),
+				tag(": "), // the spec requires a space after the colon
 				not_line_ending
 			)
-		) |
-		map!(tag!("END-OF-LOG"), |s| (s, ""))
-	)
-);
+		),
+		map(tag("END-OF-LOG"), |s| (s, ""))
+	))(input)
+}
 
-named!(
-	cabrillo_email<&str, &str>,
-	re_match_static!(r"^([a-zA-Z0-9_\-\.]+)@([a-zA-Z0-9_\-\.]+)\.([a-zA-Z]{2,5})$")
-);
+fn cabrillo_email_chars(input: &str) -> IResult<&str, &str> {
+	recognize(
+		alt((
+			alphanumeric1,
+			recognize(many1(one_of("_-.")))
+		))
+	)(input)
+}
 
-named!(
-	cabrillo_grid_locator<&str, &str>,
-	re_match_static!(r"^([A-Ra-r]{2})([0-9]{2})([A-Ra-r]{2}){0,1}$")
-);
+fn cabrillo_email(input: &str) -> IResult<&str, &str> {
+	recognize(
+		tuple((
+			cabrillo_email_chars,
+			tag("@"),
+			cabrillo_email_chars,
+			tag("."),
+			take_while_m_n(2, 5, char::is_alphanumeric)
+		))
+	)(input)
+}
 
-named!(
-	cabrillo_callsign<&str, &str>,
-	re_find_static!(r"((@{0,1})([A-Za-z0-9]{3,8})(/[A-Za-z0-9]{1,8}){0,1})")
-);
+fn cabrillo_grid_locator(input: &str) -> IResult<&str, &str> {
+	recognize(
+		tuple((
+			many_m_n(2, 2, one_of("ABCDEFGHIJKLMNOPQR")),
+			many_m_n(2, 2, one_of("0123456789")),
+			opt(many_m_n(2, 2, one_of("abcdefghijklmnopqrstuvwxyz"))),
+			opt(many_m_n(2, 2, one_of("0123456789"))),
+			eof
+		))
+	)(input)
+}
 
-named!(
-	cabrillo_datetime<&str, &str>,
-	re_find_static!(r"([0-9]{4})-([0-9]{2})-([0-9]{2}) ([0-9]{4})")
-);
+// named!(
+// 	cabrillo_grid_locator<&str, &str>),
+// 	re_match_static!(r"^([A-Ra-r]{2})([0-9]{2})([A-Ra-r]{2}){0,1}$")
+// );
 
-named!(
-	cabrillo_mode<&str, &str>,
-	alt!(tag!("CW") | tag!("PH") | tag!("FM")| tag!("RY") | tag!("DG"))
-);
+fn cabrillo_callsign(input: &str) -> IResult<&str, &str> {
+	recognize(
+		tuple((
+			opt(tag("@")),
+			take_while_m_n(3, 8, char::is_alphanumeric),
+			opt(
+				preceded(
+					tag("/"),
+					take_while_m_n(1, 8, char::is_alphanumeric)
+				)
+			)
+		))
+	)(input)
+}
 
-named!(
-	cabrillo_offtime<&str, (&str, &str)>,
-	separated_pair!(
-		cabrillo_datetime,
-		char!(' '),
-		cabrillo_datetime
-	)
-);
+fn cabrillo_datetime(input: &str) -> IResult<&str, NaiveDateTime> {
+	map_res(
+		recognize(
+			tuple((
+				take_while_m_n(4, 4, |c: char| c.is_digit(10)),
+				tag("-"),
+				take_while_m_n(2, 2, |c: char| c.is_digit(10)),
+				tag("-"),
+				take_while_m_n(2, 2, |c: char| c.is_digit(10)),
+				tag(" "),
+				take_while_m_n(4, 4, |c: char| c.is_digit(10))
+			))
+		),
+		|date_str: &str| NaiveDateTime::parse_from_str(date_str, "%Y-%m-%d %H%M")
+	)(input)
+}
 
-// The only nice way to deal with minor differences in the QSO format is to have
-// separate parsers. If you don't do this then you inevitably end up down a rabbit
-// hole full of regressions and undefined behavior.
+fn cabrillo_mode(input: &str) -> IResult<&str, Mode> {
+	alt((
+		value(Mode::Cw     , tag("CW")),
+		value(Mode::Fm     , tag("FM")),
+		value(Mode::Phone  , alt((tag("PH"), tag("SSB")))),
+		value(Mode::Rtty   , alt((tag("RY"), tag("RTTY")))),
+		value(Mode::Digital, alt((tag("DG"), tag("DIGI")))),
+		value(Mode::Mixed  , tag("MIXED"))
+	))(input)
+}
 
-named!(
-	cabrillo_qso_format1<&str, (&str, &str, &str, &str, &str, &str, &str, &str, &str)>,
-	sep!(
-		multispace0,
-		tuple!(
-			digit1,             // Frequency
-			cabrillo_mode,      // Mode
-			cabrillo_datetime,  // QSO timestamp
-			cabrillo_callsign,  // Sent call
-			alphanumeric1,      // Sent RST or exchange
-			alphanumeric1,      // Sent exchange
-			cabrillo_callsign,  // Rcvd call
-			alphanumeric1,      // Rcvd RST or exchange
-			alphanumeric1       // Rcvd exchange
-		)
-	)
-);
+fn cabrillo_offtime(input: &str) -> IResult<&str, Offtime> {
+	map(
+		separated_pair(
+			cabrillo_datetime,
+			char(' '),
+			cabrillo_datetime
+		),
+		|time_pair: (NaiveDateTime, NaiveDateTime)| {
+			Offtime {
+				begin: time_pair.0,
+				end: time_pair.1
+			}
+		}
+	)(input)
+}
 
-named!(
-	cabrillo_qso_format2<&str, (&str, &str, &str, &str, &str, &str, &str)>,
-	sep!(
-		multispace0,
-		tuple!(
-			digit1,             // Frequency
-			cabrillo_mode,      // Mode
-			cabrillo_datetime,  // QSO timestamp
-			cabrillo_callsign,  // Sent call
-			alphanumeric1,      // Sent exchange
-			cabrillo_callsign,  // Rcvd call
-			alphanumeric1       // Rcvd exchange
-		)
-	)
-);
+fn cabrillo_frequency(input: &str) -> IResult<&str, Frequency> {
+	map(
+		map_res(
+			digit1,
+			|digits: &str| digits.parse::<u32>()
+		),
+		Frequency::Khz
+	)(input)
+}
+
+/*fn cabrillo_signal_report(input: &str) -> IResult<&str, SignalReport> {
+	map(
+		tuple((
+			map_opt(
+				one_of("12345")),
+				|readability: char| readability.to_digit(10)
+			)),
+			map_opt(
+				one_of("123456789")),
+				|strength: char| strength.to_digit(10)
+			)),
+			alt((
+				map_opt(
+					one_of("123456789")),
+					|tone: char| tone.to_digit(10)
+				)),
+				value(0, eof)
+			))
+		))),
+		|rst: (u32, u32, u32)| SignalReport(rst.0 as u8, rst.1 as u8, rst.2 as u8)
+	)(input)
+}*/
+
+fn cabrillo_operators(input: &str) -> IResult<&str, Vec<String>> {
+	fold_many1(
+		terminated(
+			cabrillo_callsign,
+			opt(
+				terminated(
+					tag(","),
+					space0
+				)
+			)
+		),
+		Vec::new,
+		|mut callsigns: Vec<_>, item| {
+			callsigns.push(item.to_string());
+			callsigns
+		}
+	)(input)
+}
+
+fn cabrillo_qso(input: &str) -> IResult<&str, Qso> {
+	map(
+		preceded(
+			space0,
+			tuple((
+				terminated(
+					cabrillo_frequency, // Frequency
+					space1
+				),
+				terminated(
+					cabrillo_mode,      // Mode
+					space1
+				),
+				terminated(
+					cabrillo_datetime,  // QSO timestamp
+					space1,
+				),
+				terminated(
+					cabrillo_callsign,  // Sent call
+					space1
+				),
+				terminated(             // Sent exchange
+					alt((
+						map(
+							separated_pair(
+								alphanumeric1,
+								space1,
+								recognize(
+									tuple((
+										not(cabrillo_callsign),
+										alphanumeric1
+									))
+								)
+							),
+							|pair: (&str, &str)| format!("{} {}", pair.0, pair.1)
+						),
+						map(alphanumeric1, |i: &str| i.to_string())
+					)),
+					space1
+				),
+				terminated(
+					cabrillo_callsign,  // Rcvd call
+					space1
+				),
+				terminated(             // Recvd exchange
+					alt((
+						map(
+							separated_pair(
+								alphanumeric1,
+								space1,
+								recognize(
+									tuple((
+										not(cabrillo_callsign),
+										alphanumeric1
+									))
+								)
+							),
+							|pair: (&str, &str)| format!("{} {}", pair.0, pair.1)
+						),
+						map(alphanumeric1, |i: &str| i.to_string())
+					)),
+					space0
+				)
+			)),
+		),
+		|data: (Frequency, Mode, NaiveDateTime, &str, String, &str, String)| {
+			Qso {
+				frequency: data.0,
+				mode: data.1,
+				datetime: data.2,
+				call_sent: data.3.to_string(),
+				exch_sent: data.4,
+				call_recvd: data.5.to_string(),
+				exch_recvd: data.6,
+				transmitter_id: false
+			}
+		}
+	)(input)
+}
+
+fn cabrillo_log_start<'a>(input: &'a str, log: &'a mut CabrilloLog) -> IResult<&'a str, ()> {
+	map(
+		alt((tag("2.0"), tag("3.0"))),
+		|version: &str| {
+			log.version = version.parse::<f32>().unwrap()
+		}
+	)(input)
+}
+
+fn cabrillo_log_callsign<'a>(input: &'a str, log: &'a mut CabrilloLog) -> IResult<&'a str, ()> {
+	map(
+		cabrillo_callsign,
+		|call: &str| log.callsign = Some(call.to_string())
+	)(input)
+}
+
+fn cabrillo_log_contest<'a>(input: &'a str, log: &'a mut CabrilloLog) -> IResult<&'a str, ()> {
+	log.contest = Some(input.trim().to_string());
+	Ok(("", ()))
+}
+
+fn cabrillo_log_category_assisted<'a>(input: &'a str, log: &'a mut CabrilloLog) -> IResult<&'a str, ()> {
+	map(
+		alt((
+			value(Some(true) , tag("ASSISTED")),
+			value(Some(false), tag("NON-ASSISTED"))
+		)),
+		|yesno: Option<bool>| log.category_assisted = yesno
+	)(input)
+}
+
+fn cabrillo_log_category_band<'a>(input: &'a str, log: &'a mut CabrilloLog) -> IResult<&'a str, ()> {
+	map(
+		alt((
+			alt((
+				value(Band::All      , tag("ALL")),
+				value(Band::Band160M , tag("160M")),
+				value(Band::Band80M  , tag("80M")),
+				value(Band::Band40M  , tag("40M")),
+				value(Band::Band20M  , tag("20M")),
+				value(Band::Band15M  , tag("15M")),
+				value(Band::Band10M  , tag("10M")),
+				value(Band::Band6M   , tag("6M")),
+				value(Band::Band4M   , tag("4M")),
+				value(Band::Band2M   , tag("2M")),
+				value(Band::Band222  , tag("222")),
+				value(Band::Band432  , tag("432")),
+				value(Band::Band902  , tag("902")),
+				value(Band::Band1_2G , tag("1.2G")),
+				value(Band::Band2_3G , tag("2.3G")),
+				value(Band::Band3_4G , tag("3.4G")),
+				value(Band::Band5_7G , tag("5.7G")),
+				value(Band::Band10G  , tag("10G")),
+				value(Band::Band24G  , tag("24G")),
+				value(Band::Band47G  , tag("47G")),
+			)),
+			alt((
+				value(Band::Band75G  , tag("75G")),
+				value(Band::Band123G , tag("123G")),
+				value(Band::Band134G , tag("134G")),
+				value(Band::Band241G , tag("241G")),
+				value(Band::Light    , tag("LIGHT")),
+				value(Band::Vhf3Band , tag("VHF-3-BAND")),
+				value(Band::VhfFmOnly, tag("VHF-FM-ONLY"))
+			))
+		)),
+		|band: Band| log.category_band = Some(band)
+	)(input)
+}
+
+fn cabrillo_log_category_mode<'a>(input: &'a str, log: &'a mut CabrilloLog) -> IResult<&'a str, ()> {
+	map(
+		cabrillo_mode,
+		|mode: Mode| log.category_mode = Some(mode)
+	)(input)
+}
+
+fn cabrillo_log_category_operator<'a>(input: &'a str, log: &'a mut CabrilloLog) -> IResult<&'a str, ()> {
+	map(
+		alt((
+			value(OperatorCategory::SingleOp, tag("SINGLE-OP")),
+			value(OperatorCategory::MultiOp , tag("MULTI-OP")),
+			value(OperatorCategory::CheckLog, tag("CHECKLOG"))
+		)),
+		|op: OperatorCategory| log.category_operator = Some(op)
+	)(input)
+}
+
+fn cabrillo_log_category_power<'a>(input: &'a str, log: &'a mut CabrilloLog) -> IResult<&'a str, ()> {
+	map(
+		alt((
+			value(PowerCategory::High, tag("HIGH")),
+			value(PowerCategory::Low , tag("LOW")),
+			value(PowerCategory::Qrp , tag("QRP"))
+		)),
+		|power: PowerCategory| log.category_power = Some(power)
+	)(input)
+}
+
+fn cabrillo_log_category_station<'a>(input: &'a str, log: &'a mut CabrilloLog) -> IResult<&'a str, ()> {
+	map(
+		alt((
+			value(StationCategory::Fixed         , tag("FIXED")),
+			value(StationCategory::Mobile        , tag("MOBILE")),
+			value(StationCategory::Portable      , tag("PORTABLE")),
+			value(StationCategory::Rover         , tag("ROVER")),
+			value(StationCategory::RoverLimited  , tag("ROVER-LIMITED")),
+			value(StationCategory::RoverUnlimited, tag("ROVER-UNLIMITED")),
+			value(StationCategory::Expedition    , tag("EXPEDITION")),
+			value(StationCategory::Hq            , tag("HQ")),
+			value(StationCategory::School        , tag("SCHOOL"))
+		)),
+		|st: StationCategory| log.category_station = Some(st)
+	)(input)
+}
+
+fn cabrillo_log_category_time<'a>(input: &'a str, log: &'a mut CabrilloLog) -> IResult<&'a str, ()> {
+	map(
+		alt((
+			value(TimeCategory::Hours6 , tag("6-HOURS")),
+			value(TimeCategory::Hours12, tag("12-HOURS")),
+			value(TimeCategory::Hours24, tag("24-HOURS"))
+		)),
+		|time: TimeCategory| log.category_time = Some(time)
+	)(input)
+}
+
+fn cabrillo_log_category_xmitter<'a>(input: &'a str, log: &'a mut CabrilloLog) -> IResult<&'a str, ()> {
+	map(
+		alt((
+			value(TransmitterCategory::One      , tag("ONE")),
+			value(TransmitterCategory::Two      , tag("TWO")),
+			value(TransmitterCategory::Limited  , tag("LIMITED")),
+			value(TransmitterCategory::Unlimited, tag("UNLIMITED")),
+			value(TransmitterCategory::Swl      , tag("SWL"))
+		)),
+		|xmitter: TransmitterCategory| log.category_transmitter = Some(xmitter)
+	)(input)
+}
+
+fn cabrillo_log_category_overlay<'a>(input: &'a str, log: &'a mut CabrilloLog) -> IResult<&'a str, ()> {
+	map(
+		alt((
+			value(OverlayCategory::Classic   , tag("CLASSIC")),
+			value(OverlayCategory::Rookie    , tag("ROOKIE")),
+			value(OverlayCategory::TbWires   , tag("TB-WIRES")),
+			value(OverlayCategory::NoviceTech, tag("NOVICE-TECH")),
+			value(OverlayCategory::Over50    , tag("OVER-50"))
+		)),
+		|overlay: OverlayCategory| log.category_overlay = Some(overlay)
+	)(input)
+}
+
+fn cabrillo_log_certificate<'a>(input: &'a str, log: &'a mut CabrilloLog) -> IResult<&'a str, ()> {
+	map(
+		alt((
+			value(Some(true) , tag("YES")),
+			value(Some(false), tag("NO"))
+		)),
+		|yesno: Option<bool>| log.certificate = yesno
+	)(input)
+}
+
+fn cabrillo_log_claimed_score<'a>(input: &'a str, log: &'a mut CabrilloLog) -> IResult<&'a str, ()> {
+	map(
+		map_res(
+			digit1,
+			|score: &str| score.parse::<u32>()
+		),
+		|score: u32| log.claimed_score = Some(score)
+	)(input)
+}
+
+fn cabrillo_log_club<'a>(input: &'a str, log: &'a mut CabrilloLog) -> IResult<&'a str, ()> {
+	log.club = Some(input.trim().to_string());
+	Ok(("", ()))
+}
+
+fn cabrillo_log_created_by<'a>(input: &'a str, log: &'a mut CabrilloLog) -> IResult<&'a str, ()> {
+	log.created_by = Some(input.trim().to_string());
+	Ok(("", ()))
+}
+
+fn cabrillo_log_email<'a>(input: &'a str, log: &'a mut CabrilloLog) -> IResult<&'a str, ()> {
+	map(
+		cabrillo_email,
+		|email: &str| log.email = Some(email.to_string())
+	)(input)
+}
+
+fn cabrillo_log_grid_locator<'a>(input: &'a str, log: &'a mut CabrilloLog) -> IResult<&'a str, ()> {
+	map(
+		cabrillo_grid_locator,
+		|grid_square: &str| log.grid_locator = Some(grid_square.to_string())
+	)(input)
+}
+
+fn cabrillo_log_location<'a>(input: &'a str, log: &'a mut CabrilloLog) -> IResult<&'a str, ()> {
+	log.location = Some(input.trim().to_string());
+	Ok(("", ()))
+}
+
+fn cabrillo_log_name<'a>(input: &'a str, log: &'a mut CabrilloLog) -> IResult<&'a str, ()> {
+	log.name = Some(input.trim().to_string());
+	Ok(("", ()))
+}
+
+fn cabrillo_log_addr_fragment<'a>(input: &'a str, log: &'a mut CabrilloLog) -> IResult<&'a str, ()> {
+	let value = input.trim();
+
+	if let Some(ref mut address) = log.address {
+		address.push('\n');
+		address.push_str(value);
+	} else {
+		log.address = Some(value.to_string());
+	}
+	
+	Ok(("", ()))
+}
+
+fn cabrillo_log_operators<'a>(input: &'a str, log: &'a mut CabrilloLog) -> IResult<&'a str, ()> {
+	map(
+		cabrillo_operators,
+		|ops: Vec<String>| log.operators.extend(ops)
+	)(input)
+}
+
+fn cabrillo_log_offtime<'a>(input: &'a str, log: &'a mut CabrilloLog) -> IResult<&'a str, ()> {
+	map(
+		cabrillo_offtime,
+		|offtime: Offtime| log.offtimes.push(offtime)
+	)(input)
+}
+
+fn cabrillo_log_soapbox<'a>(input: &'a str, log: &'a mut CabrilloLog) -> IResult<&'a str, ()> {
+	let value = input.trim();
+
+	if let Some(ref mut soapbox) = log.soapbox {
+		soapbox.push('\n');
+		soapbox.push_str(value);
+	} else {
+		log.soapbox = Some(value.to_string());
+	}
+	
+	Ok(("", ()))
+}
+
+fn cabrillo_log_qso<'a>(input: &'a str, log: &'a mut CabrilloLog) -> IResult<&'a str, ()> {
+	map(
+		cabrillo_qso,
+		|qso: Qso| log.entries.push(qso)
+	)(input)
+}
+
+fn cabrillo_ignore_qso<'a>(input: &'a str, log: &'a mut CabrilloLog) -> IResult<&'a str, ()> {
+	map(
+		cabrillo_qso,
+		|qso: Qso| log.ignored_entries.push(qso)
+	)(input)
+}
+
+fn cabrillo_log_debug<'a>(_input: &'a str, log: &'a mut CabrilloLog) -> IResult<&'a str, ()> {
+	log.debug = true;
+	Ok(("", ()))
+}
+
+fn cabrillo_log_end<'a>(_input: &'a str, _log: &'a mut CabrilloLog) -> IResult<&'a str, ()> {
+	Ok(("", ()))
+}
 
 #[derive(Debug, Clone)]
 pub enum CabrilloErrorKind {
@@ -137,8 +637,8 @@ impl CabrilloError {
 	pub fn new(tag: &str, line: usize, kind: CabrilloErrorKind) -> Self {
 		Self {
 			tag: tag.to_string(),
-			line: line,
-			kind: kind
+			line,
+			kind
 		}
 	}
 
@@ -164,117 +664,6 @@ impl Display for CabrilloError {
 impl Error for CabrilloError {}
 
 pub type CabrilloResult<T> = std::result::Result<T, CabrilloError>;
-
-#[derive(Debug, Copy, Clone, PartialEq)]
-pub enum Band {
-	All,
-	Band160M,
-	Band80M,
-	Band40M,
-	Band20M,
-	Band15M,
-	Band10M,
-	Band6M,
-	Band4M,
-	Band2M,
-	Band222,
-	Band432,
-	Band902,
-	Band1_2G,
-	Band2_3G,
-	Band3_4G,
-	Band5_7G,
-	Band10G,
-	Band24G,
-	Band47G,
-	Band75G,
-	Band123G,
-	Band134G,
-	Band241G,
-	Light,
-	Vhf3Band,
-	VhfFmOnly
-}
-
-impl FromStr for Band {
-	type Err = CabrilloErrorKind;
-
-	fn from_str(s: &str) -> Result<Self, Self::Err> {
-		match s {
-			"ALL"   => Ok(Band::All),
-			"160M"  => Ok(Band::Band160M),
-			"80M"   => Ok(Band::Band80M),
-			"40M"   => Ok(Band::Band40M),
-			"20M"   => Ok(Band::Band20M),
-			"15M"   => Ok(Band::Band15M),
-			"10M"   => Ok(Band::Band10M),
-			"6M"    => Ok(Band::Band6M),
-			"4M"    => Ok(Band::Band4M),
-			"2M"    => Ok(Band::Band2M),
-			"222"   => Ok(Band::Band222),
-			"432"   => Ok(Band::Band432),
-			"902"   => Ok(Band::Band902),
-			"1.2G"  => Ok(Band::Band1_2G),
-			"2.3G"  => Ok(Band::Band2_3G),
-			"3.4G"  => Ok(Band::Band3_4G),
-			"5.7G"  => Ok(Band::Band5_7G),
-			"10G"   => Ok(Band::Band10G),
-			"24G"   => Ok(Band::Band24G),
-			"47G"   => Ok(Band::Band47G),
-			"75G"   => Ok(Band::Band75G),
-			"123G"  => Ok(Band::Band123G),
-			"134G"  => Ok(Band::Band134G),
-			"241G"  => Ok(Band::Band241G),
-			"LIGHT" => Ok(Band::Light),
-			"VHF-3-BAND" => Ok(Band::Vhf3Band),
-			"VHF-FM-ONLY" => Ok(Band::VhfFmOnly),
-			_ => Err(
-				CabrilloErrorKind::ParseError(format!("Invalid value '{}'", s))
-			)
-		}
-	}
-}
-
-impl TryFrom<Frequency> for Band {
-	type Error = CabrilloErrorKind;
-
-	fn try_from(other: Frequency) -> Result<Self, Self::Error> {
-		match other {
-			Frequency::Khz(freq) => {
-				match freq {
-					_ if freq >= 1800 && freq <= 2000 => Ok(Band::Band160M),
-					_ if freq >= 3500 && freq <= 4000 => Ok(Band::Band80M),
-					_ if freq >= 7000 && freq <= 7300 => Ok(Band::Band40M),
-					_ if freq >= 14000 && freq <= 14350 => Ok(Band::Band20M),
-					_ if freq >= 21000 && freq <= 21450 => Ok(Band::Band15M),
-					_ if freq >= 28000 && freq <= 29700 => Ok(Band::Band10M),
-					_ if freq >= 50000 && freq <= 54000 => Ok(Band::Band6M),
-					_ if freq >= 70000 && freq <= 70500 => Ok(Band::Band4M),
-					_ if freq >= 144000 && freq <= 148000 => Ok(Band::Band2M),
-					_ if freq >= 219000 && freq <= 225000 => Ok(Band::Band222),
-					_ if freq >= 420000 && freq <= 450000 => Ok(Band::Band432),
-					_ if freq >= 902000 && freq <= 928000 => Ok(Band::Band902),
-					_ if freq >= 1240000 && freq <= 1300000 => Ok(Band::Band1_2G),
-					_ if freq >= 2390000 && freq <= 2450000 => Ok(Band::Band2_3G),
-					_ if freq >= 3300000 && freq <= 3500000 => Ok(Band::Band3_4G),
-					_ if freq >= 5650000 && freq <= 5925000 => Ok(Band::Band5_7G),
-					_ if freq >= 10000000 && freq <= 10500000 => Ok(Band::Band10G),
-					_ if freq >= 24000000 && freq <= 24250000 => Ok(Band::Band24G),
-					_ if freq >= 47000000 && freq <= 47200000 => Ok(Band::Band47G),
-					_ if freq >= 76000000 && freq <= 81000000 => Ok(Band::Band75G),
-					_ if freq >= 122250000 && freq <= 123000000 => Ok(Band::Band123G),
-					_ if freq >= 134000000 && freq <= 141000000 => Ok(Band::Band134G),
-					_ if freq >= 241000000 && freq <= 250000000 => Ok(Band::Band241G),
-					_ if freq >= 300000000 => Ok(Band::Light), // FIXME: I'm not sure what the spec considers to be light
-					_ => Err(
-						CabrilloErrorKind::ParseError(format!("The value '{}' does not fall within a valid amateur band", other.to_string()))
-					)
-				}
-			}
-			Frequency::Light => Ok(Band::Light)
-		}
-	}
-}
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum Frequency {
@@ -322,6 +711,78 @@ impl ToString for Frequency {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
+pub enum Band {
+	All,
+	Band160M,
+	Band80M,
+	Band40M,
+	Band20M,
+	Band15M,
+	Band10M,
+	Band6M,
+	Band4M,
+	Band2M,
+	Band222,
+	Band432,
+	Band902,
+	Band1_2G,
+	Band2_3G,
+	Band3_4G,
+	Band5_7G,
+	Band10G,
+	Band24G,
+	Band47G,
+	Band75G,
+	Band123G,
+	Band134G,
+	Band241G,
+	Light,
+	Vhf3Band,
+	VhfFmOnly
+}
+
+impl TryFrom<Frequency> for Band {
+	type Error = CabrilloErrorKind;
+
+	fn try_from(other: Frequency) -> Result<Self, Self::Error> {
+		match other {
+			Frequency::Khz(freq) => {
+				match freq {
+					_ if (1800..=2000).contains(&freq) => Ok(Band::Band160M),
+					_ if (3500..=4000).contains(&freq) => Ok(Band::Band80M),
+					_ if (7000..=7300).contains(&freq) => Ok(Band::Band40M),
+					_ if (14000..=14350).contains(&freq) => Ok(Band::Band20M),
+					_ if (21000..=21450).contains(&freq) => Ok(Band::Band15M),
+					_ if (28000..=29700).contains(&freq) => Ok(Band::Band10M),
+					_ if (50000..=54000).contains(&freq) => Ok(Band::Band6M),
+					_ if (70000..=70500).contains(&freq) => Ok(Band::Band4M),
+					_ if (144000..=148000).contains(&freq) => Ok(Band::Band2M),
+					_ if (219000..=225000).contains(&freq) => Ok(Band::Band222),
+					_ if (420000..=450000).contains(&freq) => Ok(Band::Band432),
+					_ if (902000..=928000).contains(&freq) => Ok(Band::Band902),
+					_ if (1240000..=1300000).contains(&freq) => Ok(Band::Band1_2G),
+					_ if (2390000..=2450000).contains(&freq) => Ok(Band::Band2_3G),
+					_ if (3300000..=3500000).contains(&freq) => Ok(Band::Band3_4G),
+					_ if (5650000..=5925000).contains(&freq) => Ok(Band::Band5_7G),
+					_ if (10000000..=10500000).contains(&freq) => Ok(Band::Band10G),
+					_ if (24000000..=24250000).contains(&freq) => Ok(Band::Band24G),
+					_ if (47000000..=47200000).contains(&freq) => Ok(Band::Band47G),
+					_ if (76000000..=81000000).contains(&freq) => Ok(Band::Band75G),
+					_ if (122250000..=123000000).contains(&freq) => Ok(Band::Band123G),
+					_ if (134000000..=141000000).contains(&freq) => Ok(Band::Band134G),
+					_ if (241000000..=250000000).contains(&freq) => Ok(Band::Band241G),
+					_ if freq >= 300000000 => Ok(Band::Light),
+					_ => Err(
+						CabrilloErrorKind::ParseError(format!("The value '{}' does not fall within a valid amateur band", other.to_string()))
+					)
+				}
+			},
+			Frequency::Light => Ok(Band::Light)
+		}
+	}
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub enum Mode {
 	Cw,
 	Phone,
@@ -331,70 +792,10 @@ pub enum Mode {
 	Mixed
 }
 
-impl FromStr for Mode {
-	type Err = CabrilloErrorKind;
-
-	fn from_str(s: &str) -> Result<Self, Self::Err> {
-		match s {
-			"CW"    => Ok(Mode::Cw),
-			"DIGI"  => Ok(Mode::Digital),
-			"FM"    => Ok(Mode::Fm),
-			"RY"    => Ok(Mode::Rtty),
-			"RTTY"  => Ok(Mode::Rtty),
-			"PH"    => Ok(Mode::Phone),
-			"SSB"   => Ok(Mode::Phone),
-			"MIXED" => Ok(Mode::Mixed),
-			_ => Err(
-				CabrilloErrorKind::ParseError(format!("Invalid value '{}'", s))
-			)
-		}
-	}
-}
-
 /// A tuple type representing the 3 parts of a signal report (readability, strength, and tone). If the tone
 /// will always be zero if it is not provided.
-#[derive(Debug, Copy, Clone, PartialEq)]
-pub struct SignalReport(u8, u8, u8);
-
-impl FromStr for SignalReport {
-	type Err = CabrilloErrorKind;
-
-	fn from_str(s: &str) -> Result<Self, Self::Err> {
-		// all of this nonsense is because from_str_radix requires &str and this is the only way I could think of
-		// to get a list of &str's for each character in the string but maybe I'm being dense about his whole thing
-		let chars: Vec<&str> = s
-			.split("")
-			.filter(|i| i != &"")
-			.collect();
-		
-		if chars.len() < 2 || chars.len() > 3 {
-			return Err(
-				CabrilloErrorKind::ParseError(
-					format!("Value has incorrect length ({} bytes); must be 2 or 3.", s.len())
-				)
-			);
-		}
-
-		let parse_error = CabrilloErrorKind::ParseError(format!("Invalid digit in value '{}'", s));
-		
-		let readability: u8 = u8::from_str_radix(chars[0], 10)
-			.map_err(|_| parse_error.clone())?;
-		let strength: u8 = u8::from_str_radix(chars[1], 10)
-			.map_err(|_| parse_error.clone())?;
-		let tone: u8 = if let Some(tone_char) = chars.get(2) {
-			u8::from_str_radix(tone_char, 10)
-				.map_err(|_| parse_error.clone())?
-		} else {
-			0
-		};
-
-		if readability > 0 && readability <= 5 && strength > 0 && strength <= 9 && tone <= 9 {
-			Ok(SignalReport(readability, strength, tone))
-		} else {
-			Err(parse_error)
-		}
-	}
-}
+/*#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct SignalReport(u8, u8, u8);*/
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum OperatorCategory {
@@ -403,41 +804,11 @@ pub enum OperatorCategory {
 	CheckLog
 }
 
-impl FromStr for OperatorCategory {
-	type Err = CabrilloErrorKind;
-
-	fn from_str(s: &str) -> Result<Self, Self::Err> {
-		match s {
-			"SINGLE-OP" => Ok(OperatorCategory::SingleOp),
-			"MULTI-OP"  => Ok(OperatorCategory::MultiOp),
-			"CHECKLOG"  => Ok(OperatorCategory::CheckLog),
-			_ => Err(
-				CabrilloErrorKind::ParseError(format!("Invalid value '{}'", s))
-			)
-		}
-	}
-}
-
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum PowerCategory {
 	High,
 	Low,
 	Qrp
-}
-
-impl FromStr for PowerCategory {
-	type Err = CabrilloErrorKind;
-
-	fn from_str(s: &str) -> Result<Self, Self::Err> {
-		match s {
-			"HIGH" => Ok(PowerCategory::High),
-			"LOW"  => Ok(PowerCategory::Low),
-			"QRP"  => Ok(PowerCategory::Qrp),
-			_ => Err(
-				CabrilloErrorKind::ParseError(format!("Invalid value '{}'", s))
-			)
-		}
-	}
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -453,48 +824,12 @@ pub enum StationCategory {
 	School
 }
 
-impl FromStr for StationCategory {
-	type Err = CabrilloErrorKind;
-
-	fn from_str(s: &str) -> Result<Self, Self::Err> {
-		match s {
-			"FIXED"           => Ok(StationCategory::Fixed),
-			"MOBILE"          => Ok(StationCategory::Mobile),
-			"PORTABLE"        => Ok(StationCategory::Portable),
-			"ROVER"           => Ok(StationCategory::Rover),
-			"ROVER-LIMITED"   => Ok(StationCategory::RoverLimited),
-			"ROVER-UNLIMITED" => Ok(StationCategory::RoverUnlimited),
-			"EXPEDITION"      => Ok(StationCategory::Expedition),
-			"HQ"              => Ok(StationCategory::Hq),
-			"SCHOOL"          => Ok(StationCategory::School),
-			_ => Err(
-				CabrilloErrorKind::ParseError(format!("Invalid value '{}'", s))
-			)
-		}
-	}
-}
-
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum TimeCategory {
 	Hours6,
 	Hours12,
 	Hours24
 }
-
-impl FromStr for TimeCategory {
-	type Err = CabrilloErrorKind;
-
-	fn from_str(s: &str) -> Result<Self, Self::Err> {
-		match s {
-			"6-HOURS"  => Ok(TimeCategory::Hours6),
-			"12-HOURS" => Ok(TimeCategory::Hours12),
-			"24-HOURS" => Ok(TimeCategory::Hours24),
-			_ => Err(
-				CabrilloErrorKind::ParseError(format!("Invalid value '{}'", s))
-			)
-		}
-	}
-}	
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum TransmitterCategory {
@@ -503,23 +838,6 @@ pub enum TransmitterCategory {
 	Limited,
 	Unlimited,
 	Swl
-}
-
-impl FromStr for TransmitterCategory {
-	type Err = CabrilloErrorKind;
-
-	fn from_str(s: &str) -> Result<Self, Self::Err> {
-		match s {
-			"ONE"       => Ok(TransmitterCategory::One),
-			"TWO"       => Ok(TransmitterCategory::Two),
-			"LIMITED"   => Ok(TransmitterCategory::Limited),
-			"UNLIMITED" => Ok(TransmitterCategory::Unlimited),
-			"SWL"       => Ok(TransmitterCategory::Swl),
-			_ => Err(
-				CabrilloErrorKind::ParseError(format!("Invalid value '{}'", s))
-			)
-		}
-	}
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -531,23 +849,6 @@ pub enum OverlayCategory {
 	Over50
 }
 
-impl FromStr for OverlayCategory {
-	type Err = CabrilloErrorKind;
-
-	fn from_str(s: &str) -> Result<Self, Self::Err> {
-		match s {
-			"CLASSIC"     => Ok(OverlayCategory::Classic),
-			"ROOKIE"      => Ok(OverlayCategory::Rookie),
-			"TB-WIRES"    => Ok(OverlayCategory::TbWires),
-			"NOVICE-TECH" => Ok(OverlayCategory::NoviceTech),
-			"OVER-50"     => Ok(OverlayCategory::Over50),
-			_ => Err(
-				CabrilloErrorKind::ParseError(format!("Invalid value '{}'", s))
-			)
-		}
-	}
-}
-
 /// A QSO is a contact made between two stations. This type holds the relevant metadata
 /// for each contact in the log.
 #[derive(Debug, Clone)]
@@ -556,10 +857,8 @@ pub struct Qso {
 	mode: Mode,
 	datetime: NaiveDateTime,
 	call_sent: String,
-	rst_sent: Option<SignalReport>,
 	exch_sent: String,
 	call_recvd: String,
-	rst_recvd: Option<SignalReport>,
 	exch_recvd: String,
 	transmitter_id: bool
 }
@@ -573,14 +872,13 @@ impl Qso {
 		&self.mode
 	}
 
+	pub fn datetime(&self) -> &NaiveDateTime {
+		&self.datetime
+	}
+
 	/// Callsign sent during QSO.
 	pub fn call_sent(&self) -> &String {
 		&self.call_sent
-	}
-
-	/// Signal report sent during QSO.
-	pub fn rst_sent(&self) -> &Option<SignalReport> {
-		&self.rst_sent
 	}
 
 	/// Exchange information sent during QSO.
@@ -593,14 +891,13 @@ impl Qso {
 		&self.call_recvd
 	}
 
-	/// Signal report received from other station.
-	pub fn rst_received(&self) -> &Option<SignalReport> {
-		&self.rst_recvd
-	}
-
 	/// Exchange information received from other station.
 	pub fn exchange_received(&self) -> &String {
 		&self.exch_recvd
+	}
+
+	pub fn transmitter_id(&self) -> bool {
+		self.transmitter_id
 	}
 }
 
@@ -625,7 +922,7 @@ impl Offtime {
 	}
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct CabrilloLog {
 	version: f32,
 	callsign: Option<String>,
@@ -661,50 +958,22 @@ impl CabrilloLog {
 	pub fn new() -> Self {
 		Self {
 			version: 3.0,
-			callsign: None,
-			contest: None,
-			category_assisted: None,
-			category_band: None,
-			category_mode: None,
-			category_operator: None,
-			category_power: None,
-			category_station: None,
-			category_time: None,
-			category_transmitter: None,
-			category_overlay: None,
-			certificate: None,
-			claimed_score: None,
-			club: None,
-			created_by: None,
-			email: None,
-			grid_locator: None,
-			location: None,
-			name: None,
-			address: None,
-			operators: vec![],
-			offtimes: vec![],
-			soapbox: None,
-			other_tags: HashMap::new(),
-			entries: vec![],
-			ignored_entries: vec![],
-			debug: false
+			..Default::default()
 		}
 	}
 
 	pub fn from_buffer(buf: &[u8]) -> CabrilloResult<Self> {
 		let mut new_log = Self::new();
-		let mut line_no = 0;
 
-		for line in buf.split(|c| c == &b'\n') {
-			let line = str::from_utf8(&line)
+		for (line_no, line) in buf.split(|c| c == &b'\n').enumerate() {
+			let line = str::from_utf8(line)
 				.map_err(|err| {
 					CabrilloError::new("", line_no, 
 						CabrilloErrorKind::IoError(
 							format!("{}", err)))
 				})?;
 
-			new_log.parse_line(line_no, &line)?;
-			line_no += 1;
+			new_log.parse_line(line_no, line)?;
 		}
 
 		Ok(new_log)
@@ -712,41 +981,36 @@ impl CabrilloLog {
 	
 	pub fn from_reader<R: BufRead>(reader: &mut R) -> CabrilloResult<Self> {
 		let mut new_log = Self::new();
-		let mut line_no = 0;
 
-		for line in reader.lines() {
+		for (line_no, line) in reader.lines().enumerate() {
 			let line = line
 				.map_err(|err| {
 					CabrilloError::new("", line_no, 
 						CabrilloErrorKind::IoError(err
 							.get_ref()
 							.map(|v| format!("{}", v))
-							.unwrap_or("Unknown I/O error".into())))
+							.unwrap_or_else(|| "Unknown I/O error".into())))
 				})?;
 
 			new_log.parse_line(line_no, &line)?;
-			line_no += 1;
 		}
 
 		Ok(new_log)
 	}
 
 	fn parse_line(&mut self, line_no: usize, line: &str) -> CabrilloResult<()> {
-		if line.len() == 0 {
+		if line.is_empty() {
 			return Ok(());
 		}
 
-		match cabrillo_tag(&line) {
-			Ok(result) => {
-				let tag = (result.1).0;
-				let value = (result.1).1;
+		match cabrillo_tag(line) {
+			Ok((_, (tag, value))) => {
 				self.parse_tag(line_no, tag, value)?;
 			},
 			Err(error) => {
 				return Err(
 					CabrilloError::new("", line_no, 
-						CabrilloErrorKind::ParseError(
-							format!("{}", error)))
+						CabrilloErrorKind::ParseError(error.to_string()))
 				);
 			}
 		}
@@ -754,298 +1018,25 @@ impl CabrilloLog {
 		Ok(())
 	}
 
-	fn parse_qso_format1(&self, line_no: usize, tag: &str, value: &str) -> CabrilloResult<Qso> {
-		let qso_data = cabrillo_qso_format1(value)
-			.map_err(|_| {
-				CabrilloError::new(tag, line_no, 
-					CabrilloErrorKind::ParseError(
-						format!("Invalid value '{}' (not valid QSO format)", value)))
-			})?;
-		let qso_data = qso_data.1;
-
-		// FIXME: impl FromStr for Frequency
-		// FIXME: this does not validate the data and the provided frequency may not be in KHz
-		let frequency: Frequency = qso_data.0.parse::<u32>()
-			.map(|freq| Frequency::Khz(freq))
-			.map_err(|_| {
-				CabrilloError::new(tag, line_no, 
-					CabrilloErrorKind::ParseError(
-						format!("Invalid value '{}' (invalid frequency)", value)))
-			})?;
-
-		let mode: Mode = qso_data.1.parse()
-			.map_err(|err_kind| CabrilloError::new(tag, line_no, err_kind))?;
-
-		let timestamp: NaiveDateTime = NaiveDateTime::parse_from_str(qso_data.2, "%Y-%m-%d %H%M")
-			.map_err(|_| {
-				CabrilloError::new(tag, line_no, 
-					CabrilloErrorKind::ParseError(
-						format!("Invalid value '{}' (invalid timestamp)", value)))
-			})?;
-
-		let sent_call: String = qso_data.3.to_string();
-		// attempt to extract signal report from exchange info
-		let sent_rst: Option<SignalReport> = qso_data.4.parse::<SignalReport>().ok();
-		let sent_exch: String = format!("{} {}", qso_data.4, qso_data.5);
-
-		let recvd_call: String = qso_data.6.to_string();
-		// attempt to extract signal report from exchange info
-		let recvd_rst: Option<SignalReport> = qso_data.7.parse::<SignalReport>().ok();
-		let recvd_exch = format!("{} {}", qso_data.7, qso_data.8);
-
-		Ok(Qso {
-			frequency: frequency,
-			mode: mode,
-			datetime: timestamp,
-			call_sent: sent_call,
-			rst_sent: sent_rst,
-			exch_sent: sent_exch,
-			call_recvd: recvd_call,
-			rst_recvd: recvd_rst,
-			exch_recvd: recvd_exch,
-			transmitter_id: false
-		})
-	}
-
-	fn parse_qso_format2(&self, line_no: usize, tag: &str, value: &str) -> CabrilloResult<Qso> {
-		let qso_data = cabrillo_qso_format2(value)
-			.map_err(|_| {
-				CabrilloError::new(tag, line_no, 
-					CabrilloErrorKind::ParseError(
-						format!("Invalid value '{}' (not valid QSO format)", value)))
-			})?;
-		let qso_data = qso_data.1;
-
-		let frequency: Frequency = qso_data.0.parse::<u32>()
-			.map(|freq| Frequency::Khz(freq))
-			.map_err(|_| {
-				CabrilloError::new(tag, line_no, 
-					CabrilloErrorKind::ParseError(
-						format!("Invalid value '{}' (invalid frequency)", value)))
-			})?;
-
-		let mode: Mode = qso_data.1.parse()
-			.map_err(|err_kind| CabrilloError::new(tag, line_no, err_kind))?;
-
-		let timestamp: NaiveDateTime = NaiveDateTime::parse_from_str(qso_data.2, "%Y-%m-%d %H%M")
-			.map_err(|_| {
-				CabrilloError::new(tag, line_no, 
-					CabrilloErrorKind::ParseError(
-						format!("Invalid value '{}' (invalid timestamp)", value)))
-			})?;
-
-		let sent_call: String = qso_data.3.to_string();
-		let sent_exch: String = qso_data.4.to_string();
-		let recvd_call: String = qso_data.5.to_string();
-		let recvd_exch = qso_data.6.to_string();
-
-		Ok(Qso {
-			frequency: frequency,
-			mode: mode,
-			datetime: timestamp,
-			call_sent: sent_call,
-			rst_sent: None,
-			exch_sent: sent_exch,
-			call_recvd: recvd_call,
-			rst_recvd: None,
-			exch_recvd: recvd_exch,
-			transmitter_id: false
-		})
-	}
-
 	fn parse_tag(&mut self, line_no: usize, tag: &str, value: &str) -> CabrilloResult<()> {
-		let value = value.trim();
-		let parse_error = CabrilloError::new(tag, line_no, 
-			CabrilloErrorKind::ParseError(format!("Invalid value '{}'", value)));
- 
-		match tag {
-			"START-OF-LOG" => {
-				self.version = value.parse()
-					.map_err(|err| CabrilloError::new(tag, line_no,
-						CabrilloErrorKind::ParseError(
-							format!("{}", err)))
-					)?;
-			},
-			"CALLSIGN" => {
-				self.callsign = Some(value.to_string());
-			},
-			"CONTEST" => {
-				self.contest = Some(value.to_string());
-			},
-			"CATEGORY-ASSISTED" => {
-				self.category_assisted = match value {
-					"ASSISTED" => Some(true),
-					"NON-ASSISTED" => Some(false),
-					_ => return Err(parse_error.clone())
-				};
-			},
-			"CATEGORY-BAND" => {
-				let band: Band = value
-					.parse()
-					.map_err(|err_kind| CabrilloError::new(tag, line_no, err_kind))?;
-				self.category_band = Some(band);
-			},
-			"CATEGORY-MODE" => {
-				let mode: Mode = value
-					.parse()
-					.map_err(|err_kind| CabrilloError::new(tag, line_no, err_kind))?;
-				self.category_mode = Some(mode);
-			},
-			"CATEGORY-OPERATOR" => {
-				let op: OperatorCategory = value
-					.parse()
-					.map_err(|err_kind| CabrilloError::new(tag, line_no, err_kind))?;
-				self.category_operator = Some(op);
-			},
-			"CATEGORY-POWER" => {
-				let power: PowerCategory = value
-					.parse()
-					.map_err(|err_kind| CabrilloError::new(tag, line_no, err_kind))?;
-				self.category_power = Some(power);
-			},
-			"CATEGORY-STATION" => {
-				let category: StationCategory = value
-					.parse()
-					.map_err(|err_kind| CabrilloError::new(tag, line_no, err_kind))?;
-				self.category_station = Some(category);
-			},
-			"CATEGORY-TIME" => {
-				let time: TimeCategory = value
-					.parse()
-					.map_err(|err_kind| CabrilloError::new(tag, line_no, err_kind))?;
-				self.category_time = Some(time)
-			},
-			"CATEGORY-TRANSMITTER" => {
-				let category: TransmitterCategory = value
-					.parse()
-					.map_err(|err_kind| CabrilloError::new(tag, line_no, err_kind))?;
-				self.category_transmitter = Some(category);
-			},
-			"CATEGORY-OVERLAY" => {
-				let overlay: OverlayCategory = value
-					.parse()
-					.map_err(|err_kind| CabrilloError::new(tag, line_no, err_kind))?;
-				self.category_overlay = Some(overlay);
-			},
-			"CERTIFICATE" => {
-				self.certificate = match value {
-					"YES" => Some(true),
-					"NO" => Some(false),
-					_ => return Err(parse_error.clone())
-				}
-			},
-			"CLAIMED-SCORE" => {
-				self.claimed_score = value
-					.parse()
-					.map_err(|_| parse_error.clone())
-					.ok();
-			},
-			"CLUB" => {
-				self.club = Some(value.to_string());
-			},
-			"CREATED-BY" => {
-				self.created_by = Some(value.to_string());
-			},
-			"EMAIL" => {
-				cabrillo_email(value)
-					.map(|email| Some((email.1).to_string()))
-					.map_err(|_| {
-						CabrilloError::new(tag, line_no, 
+ 		match TAGS.get(tag) {
+ 			Some(parser) => {
+ 				parser(value, self)
+ 					.map_err(|error| {
+ 						CabrilloError::new(
+ 							tag, 
+ 							line_no, 
 							CabrilloErrorKind::ParseError(
-								format!("Invalid value '{}' (not a valid email address)", value)))
+								error.to_string()
+							)
+						)
 					})?;
-			},
-			"GRID-LOCATOR" => {
-				cabrillo_grid_locator(value)
-					.map(|grid| Some((grid.1).to_string()))
-					.map_err(|_| {
-						CabrilloError::new(tag, line_no, 
-							CabrilloErrorKind::ParseError(
-								format!("Invalid value '{}' (not a valid grid locator)", value)))
-					})?;
-			},
-			"LOCATION" => {
-				self.location = Some(value.to_string());
-			}
-			"NAME" => {
-				self.name = Some(value.to_string());
-			},
-			"ADDRESS" | "ADDRESS-CITY" | "ADDRESS-STATE-PROVINCE" | "ADDRESS-POSTALCODE" | "ADDRESS-COUNTRY" => {
-				if let Some(ref mut address) = self.address {
-					address.push('\n');
-					address.push_str(value);
-				} else {
-					self.address = Some(value.to_string());
-				}
-			},
-			"OPERATORS" => {
-				// Note: I completely gave up on doing this in nom because it was far far too difficult to deal with
-				// the nuances surrounding separated_nonempty_list and complete/streaming
-				// FIXME: validate callsigns
-				value
-					.split(|c| c == ',' || c == ' ')
-					.filter(|call| call.len() > 0)
-					.for_each(|call| {
-						self.operators.push(call.trim().to_string())
-					});
-			},
-			"OFFTIME" => {
-				let offtime = cabrillo_offtime(value)
-					.map_err(|_| {
-						CabrilloError::new(tag, line_no, 
-							CabrilloErrorKind::ParseError(
-								format!("Invalid value '{}' (invalid timestamp format", value)))
-					})?;
-
-				let start_time = NaiveDateTime::parse_from_str((offtime.1).0, "%Y-%m-%d %H%M")
-					.map_err(|_| {
-						CabrilloError::new(tag, line_no, 
-							CabrilloErrorKind::ParseError(
-								format!("Invalid value '{}' (invalid begin time)", value)))
-					})?;
-
-				let stop_time = NaiveDateTime::parse_from_str((offtime.1).1, "%Y-%m-%d %H%M")
-					.map_err(|_| {
-						CabrilloError::new(tag, line_no, 
-							CabrilloErrorKind::ParseError(
-								format!("Invalid value '{}' (invalid end time)", value)))
-					})?;
-
-				self.offtimes.push(Offtime {
-					begin: start_time,
-					end: stop_time
-				});
-			},
-			"SOAPBOX" => {
-				if let Some(ref mut soapbox) = self.soapbox {
-					soapbox.push('\n');
-					soapbox.push_str(value);
-				} else {
-					self.soapbox = Some(value.to_string());
-				}
-			},
-			"QSO" | "X-QSO" => {
-				// first attempt to parse QSO in format1 then try format2 as a fallback
-				// if all else fails, convert the error type into CabrilloError and fail
-				// out of this function
-				let qso = self.parse_qso_format1(line_no, tag, value)
-					.or_else(|_| self.parse_qso_format2(line_no, tag, value))?;
-
-				if tag == "QSO" {
-					self.entries.push(qso);
-				} else {
-					self.ignored_entries.push(qso);
-				}
-			},
-			"DEBUG" => {
-				self.debug = true;
-			},
-			"END-OF-LOG" => {},
-			_ => {
+ 			},
+ 			None => {
 				self.other_tags.insert(tag.to_string(), value.to_string());
-			}
-		}
-
+ 			}
+ 		}
+		
 		Ok(())
 	}
 
@@ -1253,8 +1244,8 @@ mod tests {
 		let result = cabrillo_grid_locator("FN20ib");
 		assert_eq!(result, Ok(("", "FN20ib")));
 
-		let result = cabrillo_grid_locator("ar34id");
-		assert_eq!(result, Ok(("", "ar34id")));
+		let result = cabrillo_grid_locator("AR34id11");
+		assert_eq!(result, Ok(("", "AR34id11")));
 
 		let result = cabrillo_grid_locator("Az99xx");
 		assert!(result.is_err());
@@ -1275,19 +1266,19 @@ mod tests {
 			});
 	}
 
-	#[test]
+	/*#[test]
 	fn parse_signal_report() {
-		let rst: SignalReport = "599".parse().unwrap();
-		assert_eq!(rst, SignalReport(5, 9, 9));
+		let rst = cabrillo_signal_report("599");
+		assert_eq!(rst, Ok(("", SignalReport(5, 9, 9))));
 
-		let rst: SignalReport = "34".parse().unwrap();
-		assert_eq!(rst, SignalReport(3, 4, 0));
+		let rst = cabrillo_signal_report("34");
+		assert_eq!(rst, Ok(("", SignalReport(3, 4, 0))));
 
 		["7", "00", "000", "asd", "999"]
 			.iter()
 			.for_each(|signal| {
-				let rst: Result<SignalReport, CabrilloErrorKind> = signal.parse();
+				let rst = cabrillo_signal_report(signal);
 				assert!(rst.is_err());
 			});
-	}
+	}*/
 }

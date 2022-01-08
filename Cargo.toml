@@ -1,6 +1,6 @@
 [package]
 name = "cabrillo"
-version = "0.2.1"
+version = "0.3.0"
 authors = ["Alec Hussey <alec.hussey@madsoft.org>"]
 license = "MIT"
 description = "A nom parser for the Cabrillo file format used for submitting contest logs in amateur radio."
@@ -10,9 +10,9 @@ homepage = "https://github.com/alechussey/cabrillo"
 documentation = "https://docs.rs/crate/cabrillo"
 repository = "https://github.com/alechussey/cabrillo.git"
 readme = "README.md"
-edition = "2018"
+edition = "2021"
 
 [dependencies]
 lazy_static = "1.4"
-nom = { version = "5.1", features = ["regexp_macros"] }
+nom = { version = "7", features = ["alloc"] }
 chrono = "0.4"
