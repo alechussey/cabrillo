@@ -208,13 +208,36 @@ fn cabrillo_offtime(input: &str) -> IResult<&str, Offtime> {
 }
 
 fn cabrillo_frequency(input: &str) -> IResult<&str, Frequency> {
-	map(
-		map_res(
-			digit1,
-			|digits: &str| digits.parse::<u32>()
-		),
-		Frequency::Khz
-	)(input)
+	alt((
+		value(Frequency::Khz(50000)    , terminated(tag("50") , space1)),
+		value(Frequency::Khz(70000)    , terminated(tag("70") , space1)),
+		value(Frequency::Khz(144000)   , terminated(tag("144"), space1)),
+		value(Frequency::Khz(222000)   , terminated(tag("222"), space1)),
+		value(Frequency::Khz(432000)   , terminated(tag("432"), space1)),
+		value(Frequency::Khz(902000)   , terminated(tag("902"), space1)),
+		value(Frequency::Khz(1200000)  , tag("1.2G")),
+		value(Frequency::Khz(2300000)  , tag("2.3G")),
+		value(Frequency::Khz(3400000)  , tag("3.4G")),
+		value(Frequency::Khz(5700000)  , tag("5.7G")),
+		value(Frequency::Khz(10000000) , tag("10G")),
+		value(Frequency::Khz(24000000) , tag("24G")),
+		value(Frequency::Khz(47000000) , tag("47G")),
+		value(Frequency::Khz(75000000) , tag("75G")),
+		value(Frequency::Khz(122000000), tag("122G")),
+		value(Frequency::Khz(134000000), tag("134G")),
+		value(Frequency::Khz(241000000), tag("241G")),
+		value(Frequency::Light, tag("LIGHT")),
+		map(
+			map_res(
+				digit1,
+				|digits: &str| digits.parse::<u32>()
+			),
+			|freq: u32| {
+				// TODO: this should accept a frequency OR a band input and normalize to KHz
+				Frequency::Khz(freq)
+			}
+		)
+	))(input)
 }
 
 /*fn cabrillo_signal_report(input: &str) -> IResult<&str, SignalReport> {
@@ -792,10 +815,12 @@ pub enum Mode {
 	Mixed
 }
 
+/*
 /// A tuple type representing the 3 parts of a signal report (readability, strength, and tone). If the tone
 /// will always be zero if it is not provided.
-/*#[derive(Debug, Copy, Clone, PartialEq)]
-pub struct SignalReport(u8, u8, u8);*/
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct SignalReport(u8, u8, u8);
+*/
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum OperatorCategory {
@@ -1219,6 +1244,12 @@ mod tests {
 		assert_eq!(Frequency::Khz(2400000).as_ghz(), Some(2.4));
 		assert_eq!(Frequency::Light.as_mhz(), None);
 		assert_eq!(Frequency::Light.as_ghz(), None);
+	}
+
+	#[test]
+	fn parse_frequency() {
+		assert_eq!(cabrillo_frequency("144"), Ok(("", Frequency::Khz(144000)))); // 144 MHz input
+		assert_eq!(cabrillo_frequency("14280"), Ok(("", Frequency::Khz(14280)))); // 14280 KHz input
 	}
 
 	#[test]
